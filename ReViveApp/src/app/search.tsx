@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, Keyboard, Pressable, StyleSheet, View } from 'react-native';
+import { FlatList, Keyboard, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
+
 import { Snackbar, Text, useTheme } from 'react-native-paper';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
@@ -12,12 +13,12 @@ import { EmptyState } from '@/components/common';
 import { Loading } from '@/components/common/Loading';
 
 import { ROUTES } from '@/constants/routes';
-import { mockRecentSearches } from '@/mock/searches';
 import { donationService } from '@/services';
 import type { Donation } from '@/types/donation';
 import type { SearchHistory } from '@/types/search';
 
 const RECENT_SEARCHES_KEY = 'revive_recent_searches_v1';
+
 
 function clampRecentSearches(items: SearchHistory[], max = 8): SearchHistory[] {
   return items
@@ -48,9 +49,11 @@ export default function SearchScreen() {
   const [donations, setDonations] = useState<Donation[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const [snackbarVisible, setSnackbarVisible] = useState(false);
   const snackbarText = useMemo(() => 'Searching…', []);
+
 
   const isMounted = useRef(true);
   useEffect(() => {
@@ -64,14 +67,15 @@ export default function SearchScreen() {
     try {
       const raw = await AsyncStorage.getItem(RECENT_SEARCHES_KEY);
       if (!raw) {
-        setRecentSearches(mockRecentSearches);
+        setRecentSearches([]);
         return;
       }
       const parsed = JSON.parse(raw) as SearchHistory[];
       setRecentSearches(clampRecentSearches(parsed));
     } catch {
-      setRecentSearches(mockRecentSearches);
+      setRecentSearches([]);
     } finally {
+
       if (isMounted.current) setRecentLoading(false);
     }
   }, []);
@@ -110,11 +114,9 @@ export default function SearchScreen() {
     [persistRecentSearches, recentSearches],
   );
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const run = async () => {
-      const q = debouncedQuery.trim();
+  const runSearch = useCallback(
+    async (nextQuery: string, options?: { silent?: boolean }) => {
+      const q = nextQuery.trim();
       setErrorMessage(null);
 
       if (!q) {
@@ -122,31 +124,38 @@ export default function SearchScreen() {
         return;
       }
 
-      setLoading(true);
-      setSnackbarVisible(true);
+      const silent = options?.silent ?? false;
+
+      if (!silent) {
+        setLoading(true);
+        setSnackbarVisible(true);
+      }
 
       try {
         const results = await donationService.search(q);
-        if (cancelled || !isMounted.current) return;
+        if (!isMounted.current) return;
         setDonations(results);
+        // Only store non-empty queries.
         await addToRecentSearches(q);
       } catch {
-        if (cancelled || !isMounted.current) return;
+        if (!isMounted.current) return;
         setDonations([]);
         setErrorMessage('Failed to load search results.');
       } finally {
-        if (cancelled || !isMounted.current) return;
-        setLoading(false);
-        setSnackbarVisible(false);
+        if (!isMounted.current) return;
+        if (!silent) {
+          setLoading(false);
+          setSnackbarVisible(false);
+        }
       }
-    };
+    },
+    [addToRecentSearches],
+  );
 
-    run();
+  useEffect(() => {
+    runSearch(debouncedQuery);
+  }, [debouncedQuery, runSearch]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [addToRecentSearches, debouncedQuery]);
 
   const emptyState = (
     <EmptyState
@@ -180,12 +189,36 @@ style={[styles.recentChip, { backgroundColor: theme.colors.surfaceVariant }] }
     );
   };
 
+  const clearRecentSearches = useCallback(async () => {
+    setRecentSearches([]);
+    try {
+      await AsyncStorage.removeItem(RECENT_SEARCHES_KEY);
+    } catch {
+      // no-op
+    }
+  }, []);
+
+  const onRefresh = useCallback(async () => {
+    const q = query.trim();
+    if (!q) {
+      // Nothing to refresh when there is no query.
+      return;
+    }
+    setRefreshing(true);
+    try {
+      await runSearch(q, { silent: true });
+    } finally {
+      if (isMounted.current) setRefreshing(false);
+    }
+  }, [query, runSearch]);
+
   const donationList = (
     <FlatList
       data={donations}
       keyExtractor={(item) => item.id}
       contentContainerStyle={styles.listContent}
       keyboardShouldPersistTaps="handled"
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
       renderItem={({ item }) => {
         return (
           <DonationCard
@@ -196,13 +229,14 @@ style={[styles.recentChip, { backgroundColor: theme.colors.surfaceVariant }] }
             location={item.location}
             donorName={donationService.getDonorName(item.donorId)}
             createdAt={item.createdAt}
-onPress={() => router.push(`/donation/${item.id}` as unknown as never)}
+            onPress={() => router.push(ROUTES.DONATION.DETAILS(item.id) as any)}
           />
         );
       }}
       ListFooterComponent={<View style={{ height: 24 }} />}
     />
   );
+
 
   return (
     <SafeAreaWrapper>
@@ -218,22 +252,59 @@ onPress={() => router.push(`/donation/${item.id}` as unknown as never)}
               {recentLoading ? (
                 <Loading text="Loading recent searches…" />
               ) : (
-                <FlatList
-                  data={recentSearches}
-                  keyExtractor={(item) => item.id}
-                  renderItem={renderRecentSearch}
-                  horizontal
-                  contentContainerStyle={styles.recentRow}
-                  showsHorizontalScrollIndicator={false}
-                />
+                <>
+                  {recentSearches.length > 0 ? (
+                    <View style={styles.recentHeaderRow}>
+                      <Text
+                        variant="bodyMedium"
+                        style={[styles.sectionHint, { color: theme.colors.onSurfaceVariant, marginTop: 0 }]}
+                      >
+                        Recent searches
+                      </Text>
+                      <Pressable
+                        onPress={clearRecentSearches}
+                        accessibilityRole="button"
+                        accessibilityLabel="Clear all recent searches"
+                      >
+                        <Text
+                          variant="labelLarge"
+                          style={{ color: theme.colors.primary, fontWeight: '700' }}
+                        >
+                          Clear All
+                        </Text>
+                      </Pressable>
+                    </View>
+                  ) : (
+                    <Text
+                      variant="bodyMedium"
+                      style={[styles.sectionHint, { color: theme.colors.onSurfaceVariant }]}
+                    >
+                      No recent searches yet.
+                    </Text>
+                  )}
+
+                  {recentSearches.length > 0 ? (
+                    <FlatList
+                      data={recentSearches}
+                      keyExtractor={(item) => item.id}
+                      renderItem={renderRecentSearch}
+                      horizontal
+                      contentContainerStyle={styles.recentRow}
+                      showsHorizontalScrollIndicator={false}
+                    />
+                  ) : null}
+                </>
               )}
 
-              <Text
-                variant="bodyMedium"
-                style={[styles.sectionHint, { color: theme.colors.onSurfaceVariant }]}
-              >
-                Type to filter donations.
-              </Text>
+              {recentSearches.length > 0 ? (
+                <Text
+                  variant="bodyMedium"
+                  style={[styles.sectionHint, { color: theme.colors.onSurfaceVariant }]}
+                >
+                  Type to filter donations.
+                </Text>
+              ) : null}
+
             </View>
           ) : null}
 
@@ -278,6 +349,14 @@ const styles = StyleSheet.create({
   recentRow: {
     paddingVertical: 4,
   },
+  recentHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 0,
+    marginBottom: 10,
+  },
+
   recentChip: {
     paddingHorizontal: 12,
     paddingVertical: 10,
